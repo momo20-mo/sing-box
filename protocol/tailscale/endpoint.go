@@ -123,6 +123,7 @@ type Endpoint struct {
 	systemInterface     bool
 	systemInterfaceName string
 	systemInterfaceMTU  uint32
+	systemTunOptions    tun.Options
 	keyAuth             bool
 	started             atomic.Bool
 	systemDialer        *dialer.DefaultDialer
@@ -289,7 +290,9 @@ func (t *Endpoint) start(scope *adapter.Scope) error {
 		t.systemInterfaceMTU = mtu
 		tunName := t.systemInterfaceName
 		if tunName == "" {
-			tunName = tun.CalculateInterfaceName("tailscale")
+			if !C.IsAndroid {
+				tunName = tun.CalculateInterfaceName("tailscale")
+			}
 		}
 		tunOptions := tun.Options{
 			Name:                      tunName,
@@ -301,34 +304,25 @@ func (t *Endpoint) start(scope *adapter.Scope) error {
 			Logger:                    t.logger,
 			EXP_ExternalConfiguration: true,
 		}
-		systemTun, err := tun.New(tunOptions)
-		if err != nil {
-			return err
+		if C.IsAndroid {
+			t.systemTunOptions = tunOptions
+		} else {
+			err = t.startSystemInterface(scope, tunOptions)
+			if err != nil {
+				return err
+			}
 		}
-		scope.Add(systemTun.Close)
-		err = systemTun.Start()
-		if err != nil {
-			return err
-		}
-		wgTunDevice, err := newTunDeviceAdapter(systemTun, int(mtu), t.logger)
-		if err != nil {
-			return err
-		}
-		systemDialer, err := dialer.NewDefault(t.ctx, option.DialerOptions{
-			AbstractDialerOptions: option.AbstractDialerOptions{
-				BindInterface: tunName,
-			},
-		})
-		if err != nil {
-			return err
-		}
-		t.systemDialer = systemDialer
-		t.server.Tun = wgTunDevice
 	}
 	return nil
 }
 
 func (t *Endpoint) postStart(scope *adapter.Scope) error {
+	if C.IsAndroid && t.systemInterface {
+		err := t.startSystemInterface(scope, t.systemTunOptions)
+		if err != nil {
+			return err
+		}
+	}
 	err := t.server.Start()
 	if err != nil {
 		return err
@@ -503,6 +497,50 @@ func (t *Endpoint) editPrefs(sshEnabled bool) error {
 	if err != nil {
 		return E.Cause(err, "update prefs")
 	}
+	return nil
+}
+
+func (t *Endpoint) startSystemInterface(scope *adapter.Scope, tunOptions tun.Options) error {
+	var (
+		systemTun tun.Tun
+		err       error
+	)
+	if C.IsAndroid {
+		opener, ok := t.platformInterface.(interface {
+			OpenSystemInterface(options *tun.Options) (tun.Tun, error)
+		})
+		if !ok {
+			return E.New("android: platform does not support Tailscale system interface reuse")
+		}
+		systemTun, err = opener.OpenSystemInterface(&tunOptions)
+	} else {
+		systemTun, err = tun.New(tunOptions)
+	}
+	if err != nil {
+		return E.Cause(err, "open Tailscale system interface")
+	}
+	scope.Add(systemTun.Close)
+	if err = systemTun.Start(); err != nil {
+		return err
+	}
+	interfaceName, err := systemTun.Name()
+	if err != nil {
+		return E.Cause(err, "get Tailscale system interface name")
+	}
+	wgTunDevice, err := newTunDeviceAdapter(systemTun, int(tunOptions.MTU), t.logger)
+	if err != nil {
+		return err
+	}
+	systemDialer, err := dialer.NewDefault(t.ctx, option.DialerOptions{
+		AbstractDialerOptions: option.AbstractDialerOptions{
+			BindInterface: interfaceName,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	t.systemDialer = systemDialer
+	t.server.Tun = wgTunDevice
 	return nil
 }
 
